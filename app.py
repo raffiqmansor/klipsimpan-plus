@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import shutil
 import subprocess
 import tempfile
@@ -125,7 +126,8 @@ def ydl_options(**overrides: object) -> dict:
         "fragment_retries": 2,
         "extractor_retries": 1,
         "concurrent_fragment_downloads": 1,
-        "format": "bv[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b",
+        "format": "bv[ext=mp4]+ba[ext=m4a]/bv+ba/b[ext=mp4]/b",
+        "format_sort": ["res:720", "+codec:avc:m4a", "ext:mp4:m4a"],
         "merge_output_format": "mp4",
         "max_filesize": MAX_BYTES,
         "cachedir": False,
@@ -177,24 +179,72 @@ def safe_filename(title: object, jobid: str) -> str:
     return (name or f"KlipSimpan_{jobid[:8]}") + ".mp4"
 
 
+def probe_streams(path: Path) -> tuple[dict, dict]:
+    """Pastikan MP4 mempunyai aliran gambar dan suara yang sebenar.
+
+    Sambungan .mp4 tidak membuktikan fail mengandungi video. ffprobe
+    menyemak codec, dimensi dan kewujudan aliran audio yang boleh dimainkan.
+    """
+    try:
+        process = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries",
+             "stream=codec_type,codec_name,pix_fmt,width,height", "-of", "json", str(path)],
+            capture_output=True, text=True, check=True, timeout=25,
+        )
+        streams = json.loads(process.stdout).get("streams", [])
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError, ValueError) as exc:
+        raise ValueError("Fail yang dimuat turun tidak dapat disahkan sebagai video yang sah.") from exc
+    video = next((stream for stream in streams
+                  if stream.get("codec_type") == "video"
+                  and int(stream.get("width") or 0) > 0
+                  and int(stream.get("height") or 0) > 0), None)
+    audio = next((stream for stream in streams if stream.get("codec_type") == "audio"), None)
+    if video is None:
+        raise ValueError("Sumber hanya mempunyai audio tanpa gambar video. Tiada MP4 dimuat turun.")
+    if audio is None:
+        raise ValueError("Sumber video tidak mempunyai audio. Muat turun dibatalkan untuk mengelakkan fail tidak lengkap.")
+    return video, audio
+
+
 def ensure_mp4(job_dir: Path) -> Path:
-    """Gunakan MP4 sedia ada atau transkod secara tempatan jika sumber bukan MP4."""
-    videos = [p for p in job_dir.glob("video.*") if p.is_file() and p.suffix.lower() in (".mp4", ".webm", ".mkv", ".mov", ".ts")]
-    if not videos:
-        raise ValueError("Tiada fail video dijana daripada pautan ini.")
-    original = max(videos, key=lambda p: p.stat().st_size)
-    if original.suffix.lower() == ".mp4":
+    """Terima hanya fail lengkap; kod semula kepada format serasi iPad jika perlu.
+
+    Utamakan output akhir `video.<ext>` yang dihasilkan selepas merge.
+    Jangan memilih fail terbesar daripada fail perantaraan video/audio.
+    """
+    completed = [job_dir / f"video.{ext}" for ext in ("mp4", "mkv", "webm", "mov", "ts")]
+    original = next((p for p in completed if p.is_file()), None)
+    if original is None:
+        raise ValueError("Video dan audio belum berjaya digabungkan. Cuba pautan lain.")
+    video, audio = probe_streams(original)
+    is_h264_compatible = video.get("codec_name") == "h264" and video.get("pix_fmt") == "yuv420p"
+    is_aac = audio.get("codec_name") == "aac"
+    if original.suffix.lower() == ".mp4" and is_h264_compatible and is_aac:
         return original
+
     target = job_dir / "klip_terhasil.mp4"
-    subprocess.run([
-        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-i", str(original),
-        "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "libx264", "-preset", "veryfast",
-        "-crf", "25", "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart",
-        "-fs", str(MAX_BYTES + 1), str(target)
-    ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=240)
-    original.unlink(missing_ok=True)
+    video_codec = ["-c:v", "copy"] if is_h264_compatible else [
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "25",
+        "-pix_fmt", "yuv420p", "-profile:v", "main",
+    ]
+    audio_codec = ["-c:a", "copy"] if is_aac else [
+        "-c:a", "aac", "-b:a", "128k", "-ac", "2",
+    ]
+    try:
+        subprocess.run([
+            "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-i", str(original), "-map", "0:v:0", "-map", "0:a:0",
+            *video_codec, *audio_codec,
+            "-movflags", "+faststart", "-fs", str(MAX_BYTES + 1), str(target),
+        ], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=420)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as exc:
+        raise ValueError("Penukaran video ke MP4 serasi iPad gagal. Cuba video yang lebih pendek.") from exc
     if not target.is_file():
         raise ValueError("Fail MP4 tidak dapat disediakan.")
+    output_video, output_audio = probe_streams(target)
+    if output_video.get("codec_name") != "h264" or output_audio.get("codec_name") != "aac":
+        raise ValueError("Format akhir tidak serasi dengan iPad. Fail tidak diedarkan.")
+    original.unlink(missing_ok=True)
     return target
 
 
@@ -221,7 +271,7 @@ def download_worker(jobid: str, url: str) -> None:
             enforce_meta(info)
             update_job(jobid, title=info.get("title") or "Video", platform=platform_for((urlsplit(url).hostname or "").lower()))
             ydl.download([url])
-        update_job(jobid, status="processing", message="Menyediakan MP4…", progress=98)
+        update_job(jobid, status="processing", message="Mengesahkan gambar, suara dan keserasian iPad…", progress=98)
         output = ensure_mp4(job_dir)
         if output.stat().st_size > MAX_BYTES:
             raise ValueError(f"Fail melebihi had {MAX_BYTES // 1024**2} MB.")
@@ -229,7 +279,7 @@ def download_worker(jobid: str, url: str) -> None:
             raise ValueError("Fail video kosong.")
         with LOCK:
             title = JOBS[jobid].get("title")
-        update_job(jobid, status="ready", message="Video sedia disimpan.", progress=100,
+        update_job(jobid, status="ready", message="MP4 disahkan mengandungi gambar dan suara.", progress=100,
                    filename=safe_filename(title, jobid), file=str(output), size=output.stat().st_size)
     except Exception as exc:
         error = str(exc) if isinstance(exc, ValueError) else friendly_error(exc)
