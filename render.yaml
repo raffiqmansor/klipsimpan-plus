@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: klipsimpan
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: MAX_VIDEO_MB
+        value: 200
+      - key: MAX_VIDEO_MINUTES
+        value: 15
