@@ -294,13 +294,51 @@ def housekeeping():
     cleanup_expired()
 
 
+def embed_allowed_origins() -> str:
+    """Allow Google Sites to embed only the application page.
+
+    Optional additional *exact HTTPS origins* can be set through the Render
+    environment variable EMBED_ALLOWED_ORIGINS, separated by spaces or commas.
+    Paths, ports, wildcards and malformed origins are intentionally rejected.
+    """
+    origins = [
+        "'self'",
+        "https://sites.google.com",
+        "https://*.google.com",
+        "https://*.googleusercontent.com",
+    ]
+    for origin in re.split(r"[,\s]+", os.environ.get("EMBED_ALLOWED_ORIGINS", "")):
+        origin = origin.strip().lower()
+        if re.fullmatch(r"https://(?:[a-z0-9-]+\.)+[a-z]{2,63}", origin) and origin not in origins:
+            origins.append(origin)
+    return " ".join(origins)
+
+
 @app.after_request
 def headers(response):
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["X-Frame-Options"] = "DENY"
-    response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; base-uri 'none'; form-action 'self'"
-    response.headers["Cache-Control"] = "no-store" if request.path.startswith("/api/") else "public, max-age=300"
+    # An X-Frame-Options: DENY header blocked embedding inside Google Sites.
+    # Keep anti-clickjacking protection for other routes, but allow trusted
+    # Google Sites ancestors through CSP for the HTML application page only.
+    home_page = request.path == "/"
+    if home_page:
+        response.headers.pop("X-Frame-Options", None)
+    else:
+        response.headers["X-Frame-Options"] = "DENY"
+    policy = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; "
+        "connect-src 'self'; base-uri 'none'; form-action 'self'"
+    )
+    response.headers["Content-Security-Policy"] = (
+        policy + "; frame-ancestors " +
+        (embed_allowed_origins() if home_page else "'none'")
+    )
+    response.headers["Cache-Control"] = (
+        "no-store" if home_page or request.path.startswith("/api/")
+        else "public, max-age=300"
+    )
     return response
 
 
